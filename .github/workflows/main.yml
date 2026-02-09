@@ -1,8 +1,8 @@
-name: Export Azure Daily Cost
+name: Export Azure Daily Cost Detailed
 
 on:
   schedule:
-    - cron: '0 2 * * *'
+    - cron: '0 2 * * *' # รันตอน 09:00 น. เวลาไทย (เพื่อให้ข้อมูล Azure อัปเดตชัวร์ๆ)
   workflow_dispatch:
 
 jobs:
@@ -18,66 +18,74 @@ jobs:
       with:
         creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-    - name: Get Date and Token
+    - name: Get Metadata and Token
       id: vars
       run: |
-        # ตั้งค่าวันที่
-        echo "TODAY=$(TZ='Asia/Bangkok' date +'%Y%m%d')" >> $GITHUB_ENV
+        # ตั้งค่าวันที่สำหรับชื่อไฟล์และ Query
+        echo "REPORT_DATE=$(TZ='Asia/Bangkok' date +'%Y%m%d')" >> $GITHUB_ENV
         echo "START_DATE=$(date -d 'yesterday' +'%Y-%m-%dT00:00:00Z')" >> $GITHUB_ENV
         echo "END_DATE=$(date -d 'yesterday' +'%Y-%m-%dT23:59:59Z')" >> $GITHUB_ENV
         
-        # ดึง Access Token มาเพื่อใช้เรียก API โดยตรง
+        # ดึง Token และ Subscription Info
         ACCESS_TOKEN=$(az account get-access-token --query accessToken -o tsv)
         echo "::add-mask::$ACCESS_TOKEN"
         echo "AUTH_TOKEN=$ACCESS_TOKEN" >> $GITHUB_ENV
         
-        # ดึง Subscription ID จาก Credential
         SUB_ID=$(az account show --query id -o tsv)
+        SUB_NAME=$(az account show --query name -o tsv)
         echo "SUB_ID=$SUB_ID" >> $GITHUB_ENV
+        echo "SUB_NAME=$SUB_NAME" >> $GITHUB_ENV
 
     - name: Query Cost via REST API
       run: |
-        # เรียก API Cost Management โดยตรง (ไม่ต้องใช้ Extension)
         curl -X POST "https://management.azure.com/subscriptions/${{ env.SUB_ID }}/providers/Microsoft.CostManagement/query?api-version=2023-03-01" \
         -H "Authorization: Bearer ${{ env.AUTH_TOKEN }}" \
         -H "Content-Type: application/json" \
         -d '{
           "type": "Usage",
           "timeframe": "Custom",
-          "timePeriod": {
-            "from": "${{ env.START_DATE }}",
-            "to": "${{ env.END_DATE }}"
-          },
+          "timePeriod": { "from": "${{ env.START_DATE }}", "to": "${{ env.END_DATE }}" },
           "dataset": {
             "granularity": "Daily",
-            "aggregation": {
-              "totalCost": {
-                "name": "PreTaxCost",
-                "function": "Sum"
-              }
-            },
+            "aggregation": { "totalCost": { "name": "PreTaxCost", "function": "Sum" } },
             "grouping": [
-              {
-                "type": "Dimension",
-                "name": "ResourceGroup"
-              },
-              {
-                "type": "Dimension",
-                "name": "ServiceName"
-              }
+              { "type": "Dimension", "name": "ResourceGroup" },
+              { "type": "Dimension", "name": "ServiceName" },
+              { "type": "Dimension", "name": "ResourceLocation" },
+              { "type": "Dimension", "name": "ResourceId" },
+              { "type": "Dimension", "name": "Meter" }
             ]
           }
         }' -o raw_cost.json
 
-    - name: Convert JSON to CSV
+    - name: Convert to CSV with Custom Format
       run: |
-        # ใช้ jq (มีใน GitHub Runner อยู่แล้ว) แปลง JSON เป็น CSV format
-        echo "PreTaxCost,Date,ResourceGroup,ServiceName,Currency" > ${{ env.TODAY }}_subscription_dailycost.csv
-        jq -r '.properties.rows[] | @csv' raw_cost.json >> ${{ env.TODAY }}_subscription_dailycost.csv
+        # สร้าง Header ตามที่ต้องการ
+        echo "ReportDate,UsageDate,SubscriptionName,PreTaxCost,Currency,ResourceLocation,ServiceName,ResourceGroup,Meter,ResourceId" > "${{ env.REPORT_DATE }}_${{ env.SUB_ID }}_dailycost.csv"
+        
+        # ใช้ jq จัดเรียงลำดับคอลัมน์ใหม่ (คอลัมน์ 0=Cost, 1=Date, 2=RG, 3=Service, 4=Location, 5=ID, 6=Meter, 7=Currency)
+        jq -r --arg sub "${{ env.SUB_NAME }}" --arg rep "${{ env.REPORT_DATE }}" \
+        '.properties.rows[] | [$rep, .[1], $sub, .[0], .[7], .[4], .[3], .[2], .[6], .[5]] | @csv' \
+        raw_cost.json >> "${{ env.REPORT_DATE }}_${{ env.SUB_ID }}_dailycost.csv"
 
     - name: Upload CSV as Artifact
       uses: actions/upload-artifact@v4
       with:
         name: daily-cost-file
-        path: ${{ env.TODAY }}_subscription_dailycost.csv
-        retention-days: 30
+        path: "*.csv"
+
+    - name: Send Email
+      uses: dawidd6/action-send-mail@v3
+      with:
+        server_address: smtp.gmail.com
+        server_port: 465
+        username: ${{ secrets.MAIL_USERNAME }}
+        password: ${{ secrets.MAIL_PASSWORD }}
+        subject: Azure Daily Cost Report - ${{ env.REPORT_DATE }}
+        to: pisut@inteltion.com # เปลี่ยนเป็นเมลผู้รับ
+        from: Azure Billing Automation
+        body: |
+          รายงานค่าใช้จ่าย Azure ประจำวันที่ ${{ env.REPORT_DATE }}
+          Subscription: ${{ env.SUB_NAME }}
+          (ดูรายละเอียดในไฟล์แนบ)
+        attachments: "${{ env.REPORT_DATE }}_${{ env.SUB_ID }}_dailycost.csv"
