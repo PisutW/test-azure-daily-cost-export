@@ -79,8 +79,8 @@ jobs:
       with:
         server_address: smtp.gmail.com
         server_port: 465
-        username: ${{ secrets.MAIL_USERNAME }}
-        password: ${{ secrets.MAIL_PASSWORD }}
+        username: ${{ secrets.GMAIL }}
+        password: ${{ secrets.GMAIL_PASSWORD }}
         subject: Azure Daily Cost Report - ${{ env.REPORT_DATE }}
         to: pisut@inteltion.com # เปลี่ยนเป็นเมลผู้รับ
         from: Azure Billing Automation
