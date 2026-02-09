@@ -1,0 +1,56 @@
+name: Export Azure Daily Cost
+
+on:
+  schedule:
+    # รันทุกวันตอน 7 โมงเช้า (เวลาประเทศไทย UTC+7 คือ 00:00 UTC)
+    # คุณสามารถปรับเวลาได้ตามต้องการ
+    - cron: '0 2 * * *'
+  workflow_dispatch: # ปุ่มกดรันเองได้ manual
+
+jobs:
+  export-cost:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v3
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Get Date for Filename
+      id: date
+      run: |
+        # สร้างตัวแปรวันที่ format yyyyMMdd (Timezone ไทย)
+        echo "TODAY=$(TZ='Asia/Bangkok' date +'%Y%m%d')" >> $GITHUB_ENV
+        # กำหนดช่วงเวลาดึงข้อมูล (ดึงของเมื่อวาน เพื่อให้ข้อมูลนิ่งที่สุด)
+        echo "START_DATE=$(date -d 'yesterday' +'%Y-%m-%dT00:00:00Z')" >> $GITHUB_ENV
+        echo "END_DATE=$(date -d 'yesterday' +'%Y-%m-%dT23:59:59Z')" >> $GITHUB_ENV
+
+    - name: Query Cost and Save CSV
+      id: query
+      run: |
+        # ใช้ Azure CLI ดึงข้อมูล Cost (Query แบบ Group by Service)
+        # หากต้องการ Group แบบอื่น แก้ตรง --type และ --group-by
+        
+        az costmanagement query \
+          --type Usage \
+          --timeframe Custom \
+          --time-period from=$START_DATE to=$END_DATE \
+          --dataset-aggregation {"totalCost":{"name":"PreTaxCost","function":"Sum"}} \
+          --dataset-grouping name="ServiceName" type="Dimension" \
+          --output csv > temp_cost.csv
+
+        # เปลี่ยนชื่อไฟล์ตามโจทย์
+        mv temp_cost.csv ${{ env.TODAY }}_subscription_dailycost.csv
+        
+        echo "File created: ${{ env.TODAY }}_subscription_dailycost.csv"
+
+    - name: Upload CSV as Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: daily-cost-file
+        path: ${{ env.TODAY }}_subscription_dailycost.csv
+        retention-days: 30
