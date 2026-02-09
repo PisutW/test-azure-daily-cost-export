@@ -21,9 +21,12 @@ jobs:
     - name: Get Dates and Token
       id: vars
       run: |
-        echo "USAGE_DATE_FILE=$(date -d 'yesterday' +'%Y%m%d')" >> $GITHUB_ENV
+        # สร้างวันที่แบบ YYYYMMDD เพื่อใช้เปรียบเทียบ (แม่นยำที่สุด)
+        echo "YESTERDAY_STR=$(date -d 'yesterday' +'%Y%m%d')" >> $GITHUB_ENV
+        echo "PREV_STR=$(date -d '2 days ago' +'%Y%m%d')" >> $GITHUB_ENV
         echo "YESTERDAY_ISO=$(date -d 'yesterday' +'%Y-%m-%d')" >> $GITHUB_ENV
-        echo "PREV_ISO=$(date -d '2 days ago' +'%Y-%m-%d')" >> $GITHUB_ENV
+        
+        # ช่วงเวลาดึงข้อมูล 2 วัน
         echo "START_PERIOD=$(date -d '2 days ago' +'%Y-%m-%dT00:00:00Z')" >> $GITHUB_ENV
         echo "END_PERIOD=$(date -d 'yesterday' +'%Y-%m-%dT23:59:59Z')" >> $GITHUB_ENV
         
@@ -57,21 +60,24 @@ jobs:
 
     - name: Process CSV with Line-Item Comparison
       run: |
-        FILENAME="${{ env.USAGE_DATE_FILE }}_${{ env.SUB_ID }}_dailycost.csv"
+        FILENAME="${{ env.YESTERDAY_STR }}_${{ env.SUB_ID }}_dailycost.csv"
         echo "FILENAME=$FILENAME" >> $GITHUB_ENV
 
         # สร้าง Header
         echo "ReportDate,UsageDate,SubscriptionName,PreTaxCost,Currency,Diff_Percent,Is_Alerts,ResourceLocation,ServiceName,ResourceGroup,Meter,ResourceId" > "$FILENAME"
         
-        # ใช้ jq ในการทำ Map-Reduce เพื่อเทียบข้อมูล
-        # 1. สร้าง Dictionary ของวันก่อนหน้า โดยใช้ ResourceId+Meter เป็น Key
-        # 2. วนลูปข้อมูลของเมื่อวาน แล้วเอาไป Lookup ใน Dictionary
-        jq -r --arg yesterday "${{ env.YESTERDAY_ISO }}T00:00:00" \
-              --arg prevday "${{ env.PREV_ISO }}T00:00:00" \
+        # ปรับปรุง Logic jq: 
+        # 1. ทำความสะอาดวันที่ (ลบ - และ T ออกให้เหลือแค่ตัวเลข 8 หลัก)
+        # 2. ทำ Mapping วันก่อนหน้า
+        # 3. เทียบกับเมื่อวาน
+        jq -r --arg yesterday "${{ env.YESTERDAY_STR }}" \
+              --arg prevday "${{ env.PREV_STR }}" \
               --arg sub "${{ env.SUB_NAME }}" \
+              --arg report_date "${{ env.YESTERDAY_ISO }}" \
         '
-        ( [.properties.rows[] | select(.[1] == $prevday) | {key: (.[5] + .[6]), value: .[0]}] | from_entries ) as $prev_map |
-        .properties.rows[] | select(.[1] == $yesterday) |
+        def clean_date: . | tostring | gsub("[-T:Z]"; "") | .[0:8];
+        ( [.properties.rows[] | select((.[1] | clean_date) == $prevday) | {key: (.[5] + .[6]), value: .[0]}] | from_entries ) as $prev_map |
+        .properties.rows[] | select((.[1] | clean_date) == $yesterday) |
         (.[5] + .[6]) as $key |
         (if $prev_map[$key] then
             (($prev_map[$key] | tonumber) as $old | (.[0] | tonumber) as $new |
@@ -80,7 +86,7 @@ jobs:
         (if $diff == "NEW" then "NEW"
          elif ($diff | tonumber) > 50 then "YES"
          else "NO" end) as $alert |
-        [$yesterday, $yesterday, $sub, .[0], .[7], (if $diff == "NEW" then 0 else ($diff | tostring + "%") end), $alert, .[4], .[3], .[2], .[6], .[5]] | @csv
+        [$report_date, $report_date, $sub, .[0], .[7], (if $diff == "NEW" then 0 else ($diff | tostring + "%") end), $alert, .[4], .[3], .[2], .[6], .[5]] | @csv
         ' raw_cost.json >> "$FILENAME"
 
     - name: Check for Critical Alerts
@@ -104,11 +110,10 @@ jobs:
         to: ${{ secrets.MAIL_RECIPIENTS }}
         from: Azure Billing Automation
         body: |
-          รายงานค่าใช้จ่าย Azure รายเครื่อง/บริการ วันที่: ${{ env.YESTERDAY_ISO }}
+          รายงานค่าใช้จ่าย Azure วันที่: ${{ env.YESTERDAY_ISO }}
           -----------------------------------------------
           Subscription: ${{ env.SUB_NAME }}
-          ผลการตรวจสอบ: ${{ env.HAS_ALERT == 'true' && 'พบรายการที่ราคาเพิ่มขึ้นผิดปกติ (>50%)' || 'ราคาปกติ' }}
           -----------------------------------------------
-          * ดูรายละเอียดในไฟล์แนบ (คอลัมน์ Diff_Percent และ Is_Alerts)
-          * รายการใหม่จะแสดง Is_Alerts เป็น "NEW"
+          * ดูรายละเอียดในไฟล์แนบ
+          * หากไฟล์แนบไม่มีข้อมูล อาจเกิดจากข้อมูล Cost ของ Azure ยังไม่อัปเดตในระบบ API
         attachments: "${{ env.FILENAME }}"
