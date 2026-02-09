@@ -2,7 +2,7 @@ name: Export Azure Daily Cost Detailed
 
 on:
   schedule:
-    - cron: '0 2 * * *' # รันตอน 09:00 น. เวลาไทย (เพื่อให้ข้อมูล Azure อัปเดตชัวร์ๆ)
+    - cron: '0 2 * * *' # รันตอน 09:00 น. เวลาไทย
   workflow_dispatch:
 
 jobs:
@@ -21,8 +21,14 @@ jobs:
     - name: Get Metadata and Token
       id: vars
       run: |
-        # ตั้งค่าวันที่สำหรับชื่อไฟล์และ Query
-        echo "REPORT_DATE=$(TZ='Asia/Bangkok' date +'%Y%m%d')" >> $GITHUB_ENV
+        # ตั้งค่าวันที่เป็น "เมื่อวาน" (วันที่เกิด Usage จริง)
+        # ใช้ Format yyyyMMdd สำหรับชื่อไฟล์
+        USAGE_DATE_FILE=$(date -d 'yesterday' +'%Y%m%d')
+        # ใช้ Format yyyy-MM-dd สำหรับข้อมูลใน CSV
+        USAGE_DATE_ISO=$(date -d 'yesterday' +'%Y-%m-%d')
+        
+        echo "USAGE_DATE_FILE=$USAGE_DATE_FILE" >> $GITHUB_ENV
+        echo "USAGE_DATE_ISO=$USAGE_DATE_ISO" >> $GITHUB_ENV
         echo "START_DATE=$(date -d 'yesterday' +'%Y-%m-%dT00:00:00Z')" >> $GITHUB_ENV
         echo "END_DATE=$(date -d 'yesterday' +'%Y-%m-%dT23:59:59Z')" >> $GITHUB_ENV
         
@@ -60,32 +66,38 @@ jobs:
 
     - name: Convert to CSV with Custom Format
       run: |
-        # สร้าง Header ตามที่ต้องการ
-        echo "ReportDate,UsageDate,SubscriptionName,PreTaxCost,Currency,ResourceLocation,ServiceName,ResourceGroup,Meter,ResourceId" > "${{ env.REPORT_DATE }}_${{ env.SUB_ID }}_dailycost.csv"
+        # ตั้งชื่อไฟล์โดยใช้ USAGE_DATE_FILE (yyyyMMdd ของเมื่อวาน)
+        FILENAME="${{ env.USAGE_DATE_FILE }}_${{ env.SUB_ID }}_dailycost.csv"
+        echo "FILENAME=$FILENAME" >> $GITHUB_ENV
+
+        # สร้าง Header
+        echo "ReportDate,UsageDate,SubscriptionName,PreTaxCost,Currency,ResourceLocation,ServiceName,ResourceGroup,Meter,ResourceId" > "$FILENAME"
         
-        # ใช้ jq จัดเรียงลำดับคอลัมน์ใหม่ (คอลัมน์ 0=Cost, 1=Date, 2=RG, 3=Service, 4=Location, 5=ID, 6=Meter, 7=Currency)
-        jq -r --arg sub "${{ env.SUB_NAME }}" --arg rep "${{ env.REPORT_DATE }}" \
-        '.properties.rows[] | [$rep, .[1], $sub, .[0], .[7], .[4], .[3], .[2], .[6], .[5]] | @csv' \
-        raw_cost.json >> "${{ env.REPORT_DATE }}_${{ env.SUB_ID }}_dailycost.csv"
+        # ใช้ jq จัดเรียงคอลัมน์ โดยให้ ReportDate และ UsageDate ตรงกับวันที่เกิด Cost
+        # .[1] คือค่าวันที่ที่ Azure คืนมา (YYYY-MM-DD)
+        jq -r --arg sub "${{ env.SUB_NAME }}" \
+        '.properties.rows[] | [.[1], .[1], $sub, .[0], .[7], .[4], .[3], .[2], .[6], .[5]] | @csv' \
+        raw_cost.json >> "$FILENAME"
 
     - name: Upload CSV as Artifact
       uses: actions/upload-artifact@v4
       with:
         name: daily-cost-file
-        path: "*.csv"
+        path: "${{ env.FILENAME }}"
 
     - name: Send Email
       uses: dawidd6/action-send-mail@v3
       with:
         server_address: smtp.gmail.com
-        server_port: 465
+        server_port: 587
+        secure: false
         username: ${{ secrets.GMAIL }}
         password: ${{ secrets.GMAIL_PASSWORD }}
-        subject: Azure Daily Cost Report - ${{ env.REPORT_DATE }}
-        to: pisut@inteltion.com # เปลี่ยนเป็นเมลผู้รับ
+        subject: Azure Daily Cost Report - ${{ env.USAGE_DATE_ISO }}
+        to: ${{ secrets.MAIL_RECIPIENTS }}
         from: Azure Billing Automation
         body: |
-          รายงานค่าใช้จ่าย Azure ประจำวันที่ ${{ env.REPORT_DATE }}
+          รายงานค่าใช้จ่าย Azure ของวันที่ ${{ env.USAGE_DATE_ISO }}
           Subscription: ${{ env.SUB_NAME }}
-          (ดูรายละเอียดในไฟล์แนบ)
-        attachments: "${{ env.REPORT_DATE }}_${{ env.SUB_ID }}_dailycost.csv"
+          หมายเหตุ: ข้อมูลนี้เป็นข้อมูลการใช้งานของเมื่อวานที่สรุปยอดแล้ว
+        attachments: "${{ env.FILENAME }}"
