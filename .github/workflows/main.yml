@@ -1,4 +1,4 @@
-name: Export Azure Daily Cost with Alerts
+name: Export Azure Daily Cost Line-Item Comparison
 
 on:
   schedule:
@@ -21,11 +21,9 @@ jobs:
     - name: Get Dates and Token
       id: vars
       run: |
-        # วันที่ของข้อมูล (เมื่อวาน)
         echo "USAGE_DATE_FILE=$(date -d 'yesterday' +'%Y%m%d')" >> $GITHUB_ENV
-        echo "USAGE_DATE_ISO=$(date -d 'yesterday' +'%Y-%m-%d')" >> $GITHUB_ENV
-        
-        # ช่วงเวลาสำหรับดึงข้อมูล 2 วันย้อนหลัง (เพื่อเปรียบเทียบ)
+        echo "YESTERDAY_ISO=$(date -d 'yesterday' +'%Y-%m-%d')" >> $GITHUB_ENV
+        echo "PREV_ISO=$(date -d '2 days ago' +'%Y-%m-%d')" >> $GITHUB_ENV
         echo "START_PERIOD=$(date -d '2 days ago' +'%Y-%m-%dT00:00:00Z')" >> $GITHUB_ENV
         echo "END_PERIOD=$(date -d 'yesterday' +'%Y-%m-%dT23:59:59Z')" >> $GITHUB_ENV
         
@@ -37,7 +35,6 @@ jobs:
 
     - name: Query 2-Day Cost via REST API
       run: |
-        # ดึงข้อมูลย้อนหลัง 2 วันแบบรายวัน (Granularity: Daily)
         curl -X POST "https://management.azure.com/subscriptions/${{ env.SUB_ID }}/providers/Microsoft.CostManagement/query?api-version=2023-03-01" \
         -H "Authorization: Bearer ${{ env.AUTH_TOKEN }}" \
         -H "Content-Type: application/json" \
@@ -58,45 +55,44 @@ jobs:
           }
         }' -o raw_cost.json
 
-    - name: Calculate Percentage Change and Alert
-      id: calc
-      run: |
-        # 1. คำนวณผลรวมของเมื่อวาน (Yesterday)
-        YESTERDAY_TOTAL=$(jq -r --arg dt "${{ env.USAGE_DATE_ISO }}" '.properties.rows[] | select(.[1] == ($dt + "T00:00:00")) | .[0]' raw_cost.json | awk '{s+=$1} END {print s+0}')
-        
-        # 2. คำนวณผลรวมของวันก่อนหน้า (Day Before Yesterday)
-        PREV_DATE=$(date -d '2 days ago' +'%Y-%m-%d')
-        PREV_TOTAL=$(jq -r --arg dt "$PREV_DATE" '.properties.rows[] | select(.[1] == ($dt + "T00:00:00")) | .[0]' raw_cost.json | awk '{s+=$1} END {print s+0}')
-        
-        # 3. คำนวณ % Change และเช็ค Alert
-        # สูตร: ((New - Old) / Old) * 100
-        if (( $(echo "$PREV_TOTAL > 0" | bc -l) )); then
-          PCT_CHANGE=$(echo "scale=2; (($YESTERDAY_TOTAL - $PREV_TOTAL) / $PREV_TOTAL) * 100" | bc -l)
-        else
-          PCT_CHANGE=0
-        fi
-        
-        IS_ALERTS="NO"
-        if (( $(echo "$PCT_CHANGE > 50" | bc -l) )); then IS_ALERTS="YES"; fi
-        
-        echo "PCT_CHANGE=$PCT_CHANGE%" >> $GITHUB_ENV
-        echo "IS_ALERTS=$IS_ALERTS" >> $GITHUB_ENV
-
-    - name: Convert to CSV with Alert Columns
+    - name: Process CSV with Line-Item Comparison
       run: |
         FILENAME="${{ env.USAGE_DATE_FILE }}_${{ env.SUB_ID }}_dailycost.csv"
         echo "FILENAME=$FILENAME" >> $GITHUB_ENV
 
-        # สร้าง Header ใหม่
+        # สร้าง Header
         echo "ReportDate,UsageDate,SubscriptionName,PreTaxCost,Currency,Diff_Percent,Is_Alerts,ResourceLocation,ServiceName,ResourceGroup,Meter,ResourceId" > "$FILENAME"
         
-        # กรองเอาเฉพาะข้อมูลของเมื่อวานมาลง CSV และใส่ค่าคำนวณลงไปทุกแถว
-        jq -r --arg sub "${{ env.SUB_NAME }}" --arg dt "${{ env.USAGE_DATE_ISO }}" \
-              --arg pct "${{ env.PCT_CHANGE }}" --arg alt "${{ env.IS_ALERTS }}" \
-        '.properties.rows[] | select(.[1] == ($dt + "T00:00:00")) | [.[1], .[1], $sub, .[0], .[7], $pct, $alt, .[4], .[3], .[2], .[6], .[5]] | @csv' \
-        raw_cost.json >> "$FILENAME"
+        # ใช้ jq ในการทำ Map-Reduce เพื่อเทียบข้อมูล
+        # 1. สร้าง Dictionary ของวันก่อนหน้า โดยใช้ ResourceId+Meter เป็น Key
+        # 2. วนลูปข้อมูลของเมื่อวาน แล้วเอาไป Lookup ใน Dictionary
+        jq -r --arg yesterday "${{ env.YESTERDAY_ISO }}T00:00:00" \
+              --arg prevday "${{ env.PREV_ISO }}T00:00:00" \
+              --arg sub "${{ env.SUB_NAME }}" \
+        '
+        ( [.properties.rows[] | select(.[1] == $prevday) | {key: (.[5] + .[6]), value: .[0]}] | from_entries ) as $prev_map |
+        .properties.rows[] | select(.[1] == $yesterday) |
+        (.[5] + .[6]) as $key |
+        (if $prev_map[$key] then
+            (($prev_map[$key] | tonumber) as $old | (.[0] | tonumber) as $new |
+             if $old > 0 then (($new - $old) / $old * 100 | round) else 0 end)
+         else "NEW" end) as $diff |
+        (if $diff == "NEW" then "NEW"
+         elif ($diff | tonumber) > 50 then "YES"
+         else "NO" end) as $alert |
+        [$yesterday, $yesterday, $sub, .[0], .[7], (if $diff == "NEW" then 0 else ($diff | tostring + "%") end), $alert, .[4], .[3], .[2], .[6], .[5]] | @csv
+        ' raw_cost.json >> "$FILENAME"
 
-    - name: Send Email with Alert Status
+    - name: Check for Critical Alerts
+      id: check_alert
+      run: |
+        if grep -q "YES" "${{ env.FILENAME }}"; then
+          echo "HAS_ALERT=true" >> $GITHUB_ENV
+        else
+          echo "HAS_ALERT=false" >> $GITHUB_ENV
+        fi
+
+    - name: Send Email
       uses: dawidd6/action-send-mail@v3
       with:
         server_address: smtp.gmail.com
@@ -104,15 +100,15 @@ jobs:
         secure: false
         username: ${{ secrets.GMAIL }}
         password: ${{ secrets.GMAIL_PASSWORD }}
-        subject: "[${{ env.IS_ALERTS == 'YES' && 'ALERT' || 'Normal' }}] Azure Cost Report - ${{ env.USAGE_DATE_ISO }}"
+        subject: "[${{ env.HAS_ALERT == 'true' && 'ALERT' || 'Normal' }}] Azure Detailed Cost - ${{ env.YESTERDAY_ISO }}"
         to: ${{ secrets.MAIL_RECIPIENTS }}
         from: Azure Billing Automation
         body: |
-          รายงานค่าใช้จ่ายประจำวันที่: ${{ env.USAGE_DATE_ISO }}
+          รายงานค่าใช้จ่าย Azure รายเครื่อง/บริการ วันที่: ${{ env.YESTERDAY_ISO }}
           -----------------------------------------------
           Subscription: ${{ env.SUB_NAME }}
-          สรุปการเปลี่ยนแปลง: ${{ env.PCT_CHANGE }} (เทียบกับวันก่อนหน้า)
-          สถานะ Alert: ${{ env.IS_ALERTS }}
+          ผลการตรวจสอบ: ${{ env.HAS_ALERT == 'true' && 'พบรายการที่ราคาเพิ่มขึ้นผิดปกติ (>50%)' || 'ราคาปกติ' }}
           -----------------------------------------------
-          (รายละเอียดแยกตามราย Resource อยู่ในไฟล์แนบ)
+          * ดูรายละเอียดในไฟล์แนบ (คอลัมน์ Diff_Percent และ Is_Alerts)
+          * รายการใหม่จะแสดง Is_Alerts เป็น "NEW"
         attachments: "${{ env.FILENAME }}"
