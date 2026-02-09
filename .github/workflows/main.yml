@@ -2,7 +2,6 @@ name: Export Azure Daily Cost
 
 on:
   schedule:
-    # รันทุกวันตอน 7 โมงเช้า (UTC+7)
     - cron: '0 2 * * *'
   workflow_dispatch:
 
@@ -15,39 +14,66 @@ jobs:
       uses: actions/checkout@v3
 
     - name: Azure Login
-      uses: azure/login@v1
+      uses: azure/login@v2
       with:
         creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-    # --- ส่วนที่เพิ่มเข้ามา (แก้ไขปัญหา Error) ---
-    - name: Install Cost Management Extension
-      run: az extension add --name costmanagement
-    # ----------------------------------------
-
-    - name: Get Date for Filename
-      id: date
+    - name: Get Date and Token
+      id: vars
       run: |
+        # ตั้งค่าวันที่
         echo "TODAY=$(TZ='Asia/Bangkok' date +'%Y%m%d')" >> $GITHUB_ENV
-        # ดึงข้อมูลของ "เมื่อวาน" (เพื่อให้ได้ Cost เต็มวัน)
         echo "START_DATE=$(date -d 'yesterday' +'%Y-%m-%dT00:00:00Z')" >> $GITHUB_ENV
         echo "END_DATE=$(date -d 'yesterday' +'%Y-%m-%dT23:59:59Z')" >> $GITHUB_ENV
-
-    - name: Query Cost and Save CSV
-      id: query
-      run: |
-        # รันคำสั่ง Query หลังจากลง Extension แล้ว
-        az costmanagement query \
-          --type Usage \
-          --timeframe Custom \
-          --time-period from=$START_DATE to=$END_DATE \
-          --dataset-aggregation {"totalCost":{"name":"PreTaxCost","function":"Sum"}} \
-          --dataset-grouping name="ServiceName" type="Dimension" \
-          --output csv > temp_cost.csv
-
-        # เปลี่ยนชื่อไฟล์
-        mv temp_cost.csv ${{ env.TODAY }}_subscription_dailycost.csv
         
-        echo "File created: ${{ env.TODAY }}_subscription_dailycost.csv"
+        # ดึง Access Token มาเพื่อใช้เรียก API โดยตรง
+        ACCESS_TOKEN=$(az account get-access-token --query accessToken -o tsv)
+        echo "::add-mask::$ACCESS_TOKEN"
+        echo "AUTH_TOKEN=$ACCESS_TOKEN" >> $GITHUB_ENV
+        
+        # ดึง Subscription ID จาก Credential
+        SUB_ID=$(az account show --query id -o tsv)
+        echo "SUB_ID=$SUB_ID" >> $GITHUB_ENV
+
+    - name: Query Cost via REST API
+      run: |
+        # เรียก API Cost Management โดยตรง (ไม่ต้องใช้ Extension)
+        curl -X POST "https://management.azure.com/subscriptions/${{ env.SUB_ID }}/providers/Microsoft.CostManagement/query?api-version=2023-03-01" \
+        -H "Authorization: Bearer ${{ env.AUTH_TOKEN }}" \
+        -H "Content-Type: application/json" \
+        -d '{
+          "type": "Usage",
+          "timeframe": "Custom",
+          "timePeriod": {
+            "from": "${{ env.START_DATE }}",
+            "to": "${{ env.END_DATE }}"
+          },
+          "dataset": {
+            "granularity": "Daily",
+            "aggregation": {
+              "totalCost": {
+                "name": "PreTaxCost",
+                "function": "Sum"
+              }
+            },
+            "grouping": [
+              {
+                "type": "Dimension",
+                "name": "ResourceGroup"
+              },
+              {
+                "type": "Dimension",
+                "name": "ServiceName"
+              }
+            ]
+          }
+        }' -o raw_cost.json
+
+    - name: Convert JSON to CSV
+      run: |
+        # ใช้ jq (มีใน GitHub Runner อยู่แล้ว) แปลง JSON เป็น CSV format
+        echo "PreTaxCost,Date,ResourceGroup,ServiceName,Currency" > ${{ env.TODAY }}_subscription_dailycost.csv
+        jq -r '.properties.rows[] | @csv' raw_cost.json >> ${{ env.TODAY }}_subscription_dailycost.csv
 
     - name: Upload CSV as Artifact
       uses: actions/upload-artifact@v4
