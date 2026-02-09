@@ -1,8 +1,8 @@
-name: Export Azure Daily Cost Detailed
+name: Export Azure Daily Cost with Alerts
 
 on:
   schedule:
-    - cron: '0 2 * * *' # รันตอน 09:00 น. เวลาไทย
+    - cron: '0 2 * * *'
   workflow_dispatch:
 
 jobs:
@@ -18,39 +18,33 @@ jobs:
       with:
         creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-    - name: Get Metadata and Token
+    - name: Get Dates and Token
       id: vars
       run: |
-        # ตั้งค่าวันที่เป็น "เมื่อวาน" (วันที่เกิด Usage จริง)
-        # ใช้ Format yyyyMMdd สำหรับชื่อไฟล์
-        USAGE_DATE_FILE=$(date -d 'yesterday' +'%Y%m%d')
-        # ใช้ Format yyyy-MM-dd สำหรับข้อมูลใน CSV
-        USAGE_DATE_ISO=$(date -d 'yesterday' +'%Y-%m-%d')
+        # วันที่ของข้อมูล (เมื่อวาน)
+        echo "USAGE_DATE_FILE=$(date -d 'yesterday' +'%Y%m%d')" >> $GITHUB_ENV
+        echo "USAGE_DATE_ISO=$(date -d 'yesterday' +'%Y-%m-%d')" >> $GITHUB_ENV
         
-        echo "USAGE_DATE_FILE=$USAGE_DATE_FILE" >> $GITHUB_ENV
-        echo "USAGE_DATE_ISO=$USAGE_DATE_ISO" >> $GITHUB_ENV
-        echo "START_DATE=$(date -d 'yesterday' +'%Y-%m-%dT00:00:00Z')" >> $GITHUB_ENV
-        echo "END_DATE=$(date -d 'yesterday' +'%Y-%m-%dT23:59:59Z')" >> $GITHUB_ENV
+        # ช่วงเวลาสำหรับดึงข้อมูล 2 วันย้อนหลัง (เพื่อเปรียบเทียบ)
+        echo "START_PERIOD=$(date -d '2 days ago' +'%Y-%m-%dT00:00:00Z')" >> $GITHUB_ENV
+        echo "END_PERIOD=$(date -d 'yesterday' +'%Y-%m-%dT23:59:59Z')" >> $GITHUB_ENV
         
-        # ดึง Token และ Subscription Info
         ACCESS_TOKEN=$(az account get-access-token --query accessToken -o tsv)
         echo "::add-mask::$ACCESS_TOKEN"
         echo "AUTH_TOKEN=$ACCESS_TOKEN" >> $GITHUB_ENV
-        
-        SUB_ID=$(az account show --query id -o tsv)
-        SUB_NAME=$(az account show --query name -o tsv)
-        echo "SUB_ID=$SUB_ID" >> $GITHUB_ENV
-        echo "SUB_NAME=$SUB_NAME" >> $GITHUB_ENV
+        echo "SUB_ID=$(az account show --query id -o tsv)" >> $GITHUB_ENV
+        echo "SUB_NAME=$(az account show --query name -o tsv)" >> $GITHUB_ENV
 
-    - name: Query Cost via REST API
+    - name: Query 2-Day Cost via REST API
       run: |
+        # ดึงข้อมูลย้อนหลัง 2 วันแบบรายวัน (Granularity: Daily)
         curl -X POST "https://management.azure.com/subscriptions/${{ env.SUB_ID }}/providers/Microsoft.CostManagement/query?api-version=2023-03-01" \
         -H "Authorization: Bearer ${{ env.AUTH_TOKEN }}" \
         -H "Content-Type: application/json" \
         -d '{
           "type": "Usage",
           "timeframe": "Custom",
-          "timePeriod": { "from": "${{ env.START_DATE }}", "to": "${{ env.END_DATE }}" },
+          "timePeriod": { "from": "${{ env.START_PERIOD }}", "to": "${{ env.END_PERIOD }}" },
           "dataset": {
             "granularity": "Daily",
             "aggregation": { "totalCost": { "name": "PreTaxCost", "function": "Sum" } },
@@ -64,28 +58,45 @@ jobs:
           }
         }' -o raw_cost.json
 
-    - name: Convert to CSV with Custom Format
+    - name: Calculate Percentage Change and Alert
+      id: calc
       run: |
-        # ตั้งชื่อไฟล์โดยใช้ USAGE_DATE_FILE (yyyyMMdd ของเมื่อวาน)
+        # 1. คำนวณผลรวมของเมื่อวาน (Yesterday)
+        YESTERDAY_TOTAL=$(jq -r --arg dt "${{ env.USAGE_DATE_ISO }}" '.properties.rows[] | select(.[1] == ($dt + "T00:00:00")) | .[0]' raw_cost.json | awk '{s+=$1} END {print s+0}')
+        
+        # 2. คำนวณผลรวมของวันก่อนหน้า (Day Before Yesterday)
+        PREV_DATE=$(date -d '2 days ago' +'%Y-%m-%d')
+        PREV_TOTAL=$(jq -r --arg dt "$PREV_DATE" '.properties.rows[] | select(.[1] == ($dt + "T00:00:00")) | .[0]' raw_cost.json | awk '{s+=$1} END {print s+0}')
+        
+        # 3. คำนวณ % Change และเช็ค Alert
+        # สูตร: ((New - Old) / Old) * 100
+        if (( $(echo "$PREV_TOTAL > 0" | bc -l) )); then
+          PCT_CHANGE=$(echo "scale=2; (($YESTERDAY_TOTAL - $PREV_TOTAL) / $PREV_TOTAL) * 100" | bc -l)
+        else
+          PCT_CHANGE=0
+        fi
+        
+        IS_ALERTS="NO"
+        if (( $(echo "$PCT_CHANGE > 50" | bc -l) )); then IS_ALERTS="YES"; fi
+        
+        echo "PCT_CHANGE=$PCT_CHANGE%" >> $GITHUB_ENV
+        echo "IS_ALERTS=$IS_ALERTS" >> $GITHUB_ENV
+
+    - name: Convert to CSV with Alert Columns
+      run: |
         FILENAME="${{ env.USAGE_DATE_FILE }}_${{ env.SUB_ID }}_dailycost.csv"
         echo "FILENAME=$FILENAME" >> $GITHUB_ENV
 
-        # สร้าง Header
-        echo "ReportDate,UsageDate,SubscriptionName,PreTaxCost,Currency,ResourceLocation,ServiceName,ResourceGroup,Meter,ResourceId" > "$FILENAME"
+        # สร้าง Header ใหม่
+        echo "ReportDate,UsageDate,SubscriptionName,PreTaxCost,Currency,Diff_Percent,Is_Alerts,ResourceLocation,ServiceName,ResourceGroup,Meter,ResourceId" > "$FILENAME"
         
-        # ใช้ jq จัดเรียงคอลัมน์ โดยให้ ReportDate และ UsageDate ตรงกับวันที่เกิด Cost
-        # .[1] คือค่าวันที่ที่ Azure คืนมา (YYYY-MM-DD)
-        jq -r --arg sub "${{ env.SUB_NAME }}" \
-        '.properties.rows[] | [.[1], .[1], $sub, .[0], .[7], .[4], .[3], .[2], .[6], .[5]] | @csv' \
+        # กรองเอาเฉพาะข้อมูลของเมื่อวานมาลง CSV และใส่ค่าคำนวณลงไปทุกแถว
+        jq -r --arg sub "${{ env.SUB_NAME }}" --arg dt "${{ env.USAGE_DATE_ISO }}" \
+              --arg pct "${{ env.PCT_CHANGE }}" --arg alt "${{ env.IS_ALERTS }}" \
+        '.properties.rows[] | select(.[1] == ($dt + "T00:00:00")) | [.[1], .[1], $sub, .[0], .[7], $pct, $alt, .[4], .[3], .[2], .[6], .[5]] | @csv' \
         raw_cost.json >> "$FILENAME"
 
-    - name: Upload CSV as Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: daily-cost-file
-        path: "${{ env.FILENAME }}"
-
-    - name: Send Email
+    - name: Send Email with Alert Status
       uses: dawidd6/action-send-mail@v3
       with:
         server_address: smtp.gmail.com
@@ -93,11 +104,15 @@ jobs:
         secure: false
         username: ${{ secrets.GMAIL }}
         password: ${{ secrets.GMAIL_PASSWORD }}
-        subject: Azure Daily Cost Report - ${{ env.USAGE_DATE_ISO }}
+        subject: "[${{ env.IS_ALERTS == 'YES' && 'ALERT' || 'Normal' }}] Azure Cost Report - ${{ env.USAGE_DATE_ISO }}"
         to: ${{ secrets.MAIL_RECIPIENTS }}
         from: Azure Billing Automation
         body: |
-          รายงานค่าใช้จ่าย Azure ของวันที่ ${{ env.USAGE_DATE_ISO }}
+          รายงานค่าใช้จ่ายประจำวันที่: ${{ env.USAGE_DATE_ISO }}
+          -----------------------------------------------
           Subscription: ${{ env.SUB_NAME }}
-          หมายเหตุ: ข้อมูลนี้เป็นข้อมูลการใช้งานของเมื่อวานที่สรุปยอดแล้ว
+          สรุปการเปลี่ยนแปลง: ${{ env.PCT_CHANGE }} (เทียบกับวันก่อนหน้า)
+          สถานะ Alert: ${{ env.IS_ALERTS }}
+          -----------------------------------------------
+          (รายละเอียดแยกตามราย Resource อยู่ในไฟล์แนบ)
         attachments: "${{ env.FILENAME }}"
