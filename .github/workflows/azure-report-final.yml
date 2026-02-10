@@ -12,9 +12,7 @@ on:
 jobs:
   export-cost:
     runs-on: ubuntu-latest
-    
     steps:
-    - run: echo "If you see this in Actions, the file path and branch are correct."
     - name: Checkout Code
       uses: actions/checkout@v3
 
