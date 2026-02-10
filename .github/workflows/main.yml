@@ -2,7 +2,7 @@ name: Export Azure Daily Cost Line-Item Comparison
 
 on:
   schedule:
-    - cron: '41 9 * * *'
+    - cron: "50 2 * * *"
   workflow_dispatch:
 
 jobs:
