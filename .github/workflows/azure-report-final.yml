@@ -1,14 +1,17 @@
-name: Export Azure Daily Cost
+name: Export Azure Daily Cost Line-Item Comparison
 
 on:
   schedule:
-    - cron: '13 2 * * *' # รันตอน 09:45 น. (UTC 02:45)
+    - cron: '13 2 * * *' # รันตอน 09:13 น. เวลาไทย
+  push:
+    branches:
+      - main
+      - master
   workflow_dispatch:
 
 jobs:
   export-cost:
     runs-on: ubuntu-latest
-
     steps:
     - name: Checkout Code
       uses: actions/checkout@v3
@@ -21,12 +24,12 @@ jobs:
     - name: Get Dates and Token
       id: vars
       run: |
-        # ใช้ 2 days ago เพื่อความชัวร์ว่ามีข้อมูลแน่นอน (ถ้าลองรันครั้งแรก)
-        # หากระบบนิ่งแล้วค่อยเปลี่ยนกลับเป็น yesterday ครับ
+        # สร้างวันที่แบบ YYYYMMDD เพื่อใช้เปรียบเทียบ (แม่นยำที่สุด)
         echo "YESTERDAY_STR=$(date -d 'yesterday' +'%Y%m%d')" >> $GITHUB_ENV
         echo "PREV_STR=$(date -d '2 days ago' +'%Y%m%d')" >> $GITHUB_ENV
         echo "YESTERDAY_ISO=$(date -d 'yesterday' +'%Y-%m-%d')" >> $GITHUB_ENV
         
+        # ช่วงเวลาดึงข้อมูล 2 วัน
         echo "START_PERIOD=$(date -d '2 days ago' +'%Y-%m-%dT00:00:00Z')" >> $GITHUB_ENV
         echo "END_PERIOD=$(date -d 'yesterday' +'%Y-%m-%dT23:59:59Z')" >> $GITHUB_ENV
         
@@ -58,34 +61,44 @@ jobs:
           }
         }' -o raw_cost.json
 
-    - name: Process CSV
+    - name: Process CSV with Line-Item Comparison
       run: |
         FILENAME="${{ env.YESTERDAY_STR }}_${{ env.SUB_ID }}_dailycost.csv"
         echo "FILENAME=$FILENAME" >> $GITHUB_ENV
+
+        # สร้าง Header
         echo "ReportDate,UsageDate,SubscriptionName,PreTaxCost,Currency,Diff_Percent,Is_Alerts,ResourceLocation,ServiceName,ResourceGroup,Meter,ResourceId" > "$FILENAME"
         
-        # เพิ่ม Check ถ้าไฟล์ว่างเปล่า (null) ให้ข้าม jq ไปเลย
-        if [ -s raw_cost.json ] && [ "$(jq '.properties.rows' raw_cost.json)" != "null" ]; then
-          jq -r --arg yesterday "${{ env.YESTERDAY_STR }}" \
-                --arg prevday "${{ env.PREV_STR }}" \
-                --arg sub "${{ env.SUB_NAME }}" \
-                --arg report_date "${{ env.YESTERDAY_ISO }}" \
-          '
-          def clean_date: . | tostring | gsub("[-T:Z]"; "") | .[0:8];
-          ( [.properties.rows[] | select((.[1] | clean_date) == $prevday) | {key: (.[5] + .[6]), value: .[0]}] | from_entries ) as $prev_map |
-          .properties.rows[] | select((.[1] | clean_date) == $yesterday) |
-          (.[5] + .[6]) as $key |
-          (if $prev_map[$key] then
-              (($prev_map[$key] | tonumber) as $old | (.[0] | tonumber) as $new |
-               if $old > 0 then (($new - $old) / $old * 100 | round) else 0 end)
-           else "NEW" end) as $diff |
-          (if $diff == "NEW" then "NEW"
-           elif ($diff | tonumber) > 50 then "YES"
-           else "NO" end) as $alert |
-          [$report_date, $report_date, $sub, .[0], .[7], (if $diff == "NEW" then 0 else ($diff | tostring + "%") end), $alert, .[4], .[3], .[2], .[6], .[5]] | @csv
-          ' raw_cost.json >> "$FILENAME"
+        # ปรับปรุง Logic jq: 
+        # 1. ทำความสะอาดวันที่ (ลบ - และ T ออกให้เหลือแค่ตัวเลข 8 หลัก)
+        # 2. ทำ Mapping วันก่อนหน้า
+        # 3. เทียบกับเมื่อวาน
+        jq -r --arg yesterday "${{ env.YESTERDAY_STR }}" \
+              --arg prevday "${{ env.PREV_STR }}" \
+              --arg sub "${{ env.SUB_NAME }}" \
+              --arg report_date "${{ env.YESTERDAY_ISO }}" \
+        '
+        def clean_date: . | tostring | gsub("[-T:Z]"; "") | .[0:8];
+        ( [.properties.rows[] | select((.[1] | clean_date) == $prevday) | {key: (.[5] + .[6]), value: .[0]}] | from_entries ) as $prev_map |
+        .properties.rows[] | select((.[1] | clean_date) == $yesterday) |
+        (.[5] + .[6]) as $key |
+        (if $prev_map[$key] then
+            (($prev_map[$key] | tonumber) as $old | (.[0] | tonumber) as $new |
+             if $old > 0 then (($new - $old) / $old * 100 | round) else 0 end)
+         else "NEW" end) as $diff |
+        (if $diff == "NEW" then "NEW"
+         elif ($diff | tonumber) > 50 then "YES"
+         else "NO" end) as $alert |
+        [$report_date, $report_date, $sub, .[0], .[7], (if $diff == "NEW" then 0 else ($diff | tostring + "%") end), $alert, .[4], .[3], .[2], .[6], .[5]] | @csv
+        ' raw_cost.json >> "$FILENAME"
+
+    - name: Check for Critical Alerts
+      id: check_alert
+      run: |
+        if grep -q "YES" "${{ env.FILENAME }}"; then
+          echo "HAS_ALERT=true" >> $GITHUB_ENV
         else
-          echo "Warning: No cost data found for the selected period."
+          echo "HAS_ALERT=false" >> $GITHUB_ENV
         fi
 
     - name: Send Email
@@ -93,9 +106,17 @@ jobs:
       with:
         server_address: smtp.gmail.com
         server_port: 587
+        secure: false
         username: ${{ secrets.GMAIL }}
         password: ${{ secrets.GMAIL_PASSWORD }}
-        subject: Azure Cost Report - ${{ env.YESTERDAY_ISO }}
+        subject: "[${{ env.HAS_ALERT == 'true' && 'ALERT' || 'Normal' }}] Azure Detailed Cost - ${{ env.YESTERDAY_ISO }}"
         to: ${{ secrets.MAIL_RECIPIENTS }}
         from: Azure Billing Automation
+        body: |
+          รายงานค่าใช้จ่าย Azure วันที่: ${{ env.YESTERDAY_ISO }}
+          -----------------------------------------------
+          Subscription: ${{ env.SUB_NAME }}
+          -----------------------------------------------
+          * ดูรายละเอียดในไฟล์แนบ
+          * หากไฟล์แนบไม่มีข้อมูล อาจเกิดจากข้อมูล Cost ของ Azure ยังไม่อัปเดตในระบบ API
         attachments: "${{ env.FILENAME }}"
