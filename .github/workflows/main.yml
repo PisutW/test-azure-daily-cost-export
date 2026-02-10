@@ -1,9 +1,9 @@
 name: Export Azure Daily Cost Line-Item Comparison
 
 on:
-  push:
-    branches:
-      - main
+  schedule:
+    - cron: '41 9 * * *'
+  workflow_dispatch:
 
 jobs:
   export-cost:
