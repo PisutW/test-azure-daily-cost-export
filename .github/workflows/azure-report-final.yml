@@ -1,8 +1,8 @@
-name: Azure Final Report
+name: Export Azure Daily Cost Line-Item Comparison
 
 on:
   schedule:
-    - cron: '13 2 * * *' # รันตอน 09:13 น. เวลาไทย
+    - cron: "13 2 * * *"  # ปรับเป็น 09:30 น. เวลาไทย (UTC 02:30)
   push:
     branches:
       - main
