@@ -2,8 +2,11 @@ name: Export Azure Daily Cost Line-Item Comparison
 
 on:
   schedule:
-    - cron: "50 2 * * *"
-  workflow_dispatch:
+    - cron: '53 3 * * *'  # ลองเปลี่ยนเวลาให้เป็นเลขไม่ลงตัว (เช่น 15 นาที)
+  workflow_dispatch:      # ปุ่มกดรันเอง
+  push:                   # <--- เพิ่มบรรทัดนี้เข้าไปครับ
+    branches:
+      - main              # หรือ master แล้วแต่ชื่อ Branch หลักของคุณ
 
 jobs:
   export-cost:
