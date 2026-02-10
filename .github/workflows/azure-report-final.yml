@@ -12,10 +12,9 @@ on:
 jobs:
   export-cost:
     runs-on: ubuntu-latest
+    
     steps:
-      - run: echo "System logic active"
-
-    steps:
+    - run: echo "System logic active"
     - name: Checkout Code
       uses: actions/checkout@v3
 
