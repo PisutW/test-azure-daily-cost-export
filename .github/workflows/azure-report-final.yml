@@ -1,12 +1,12 @@
 name: Export Azure Daily Cost Line-Item Comparison
 
-on:
-  schedule:
-    - cron: '13 2 * * *' # รันตอน 09:13 น. เวลาไทย
-  push:
-    branches:
-      - main
-      - master
+#on:
+  #schedule:
+   # - cron: '13 2 * * *' # รันตอน 09:13 น. เวลาไทย
+  #push:
+   # branches:
+    #  - main
+     # - master
   workflow_dispatch:
 
 jobs:
